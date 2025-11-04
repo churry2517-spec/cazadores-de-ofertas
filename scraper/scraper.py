@@ -1,313 +1,238 @@
-# scraper/scraper.py
-import json, re, time, sys
-from typing import List, Dict
-from urllib.parse import urlencode
+import json
+import re
+import time
+from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
 
+# ---------------------------
+# Configuración
+# ---------------------------
+
+# Páginas públicas (aproximadas) donde suelen listar ofertas.
+# Si una 404/403, el scraper la salta; luego la afinamos con la URL correcta.
+STORE_PAGES = [
+    ("Plaza Vea", "https://www.plazavea.com.pe/ofertas"),
+    ("Wong", "https://www.wong.pe/ofertas"),
+    ("Oechsle", "https://www.oechsle.pe/ofertas"),
+    ("Ripley", "https://simple.ripley.com.pe/"),
+    ("Falabella", "https://www.falabella.com.pe/falabella-pe/page/ofertas"),
+    ("Tottus", "https://www.tottus.com.pe/"),
+    ("MiFarma", "https://www.mifarma.com.pe/"),
+]
+
+# Umbral de descuento mínimo a guardar
+MIN_DISCOUNT = 50  # puedes subirlo a 80 si quieres estrictamente 80%+
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
 }
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-SESSION.timeout = 25
+CURRENCY_REGX = re.compile(r"(S/\.?\s?)(\d+(?:[\.,]\d{2})?)", re.IGNORECASE)
+PERCENT_REGX = re.compile(r"(\d{1,3})\s*%")
+SPACES = re.compile(r"\s+")
 
-# ---------- Utilidades ----------
-def pct_off(list_price: float, price: float) -> float:
-    try:
-        if list_price and list_price > 0 and price and price < list_price:
-            return round(100 * (1 - price / list_price), 2)
-    except Exception:
-        pass
-    return 0.0
 
-def norm_price(x):
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = re.sub(r"[^\d,\.]", "", str(x))
-    s = s.replace(".", "").replace(",", ".")  # 1.299,90 -> 1299.90
+def clean_text(t: str) -> str:
+    return SPACES.sub(" ", t).strip()
+
+
+def to_float(s: str) -> float | None:
+    """
+    Convierte 'S/ 1,599.90' o 'S/1599' a 1599.90
+    """
     try:
-        return float(s)
+        s = s.replace("S/", "").replace("s/", "").replace("S/.", "")
+        s = s.replace(".", "").replace(",", ".")
+        return float(s.strip())
     except Exception:
         return None
 
-def keep_top_n(items: List[Dict], n=50) -> List[Dict]:
-    items = sorted(items, key=lambda r: r.get("discount_pct", 0), reverse=True)
-    return items[:n]
 
-def save_offers(rows: List[Dict], path="offers.json"):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-    print(f"[OK] Guardadas {len(rows)} ofertas en {path}")
+def fetch(url: str, timeout=20) -> BeautifulSoup | None:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        return BeautifulSoup(r.text, "lxml")
+    except Exception:
+        return None
 
-# ---------- Parsers genéricos ----------
-def parse_ldjson_products(html: str) -> List[Dict]:
-    """Extrae productos desde bloques application/ld+json (cuando existen)."""
-    out = []
-    for m in re.finditer(
-        r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
-        html,
-        re.S | re.I,
-    ):
-        try:
-            data = json.loads(m.group(1).strip())
-            if isinstance(data, dict):
-                data = [data]
-            if not isinstance(data, list):
-                continue
-            for block in data:
-                # buscamos Product
-                if isinstance(block, dict) and block.get("@type") in ("Product", ["Product"]):
-                    name = (block.get("name") or "").strip()
-                    url = block.get("url") or block.get("@id")
-                    offers = block.get("offers") or {}
-                    if isinstance(offers, list):  # a veces viene lista
-                        offers = offers[0] if offers else {}
-                    price = norm_price(offers.get("price"))
-                    list_price = norm_price(offers.get("highPrice") or offers.get("listPrice") or offers.get("price"))
-                    # si hay priceSpecification
-                    if not list_price and isinstance(offers, dict) and "priceSpecification" in offers:
-                        ps = offers["priceSpecification"]
-                        if isinstance(ps, list):
-                            ps = ps[0] if ps else {}
-                        list_price = norm_price(ps.get("price"))
-                    # fallback: a veces el listprice viene en 'price' y el real en 'lowPrice'
-                    low_price = norm_price(offers.get("lowPrice"))
-                    if low_price and (not price or low_price < price):
-                        price = low_price
-                    if price and list_price and list_price >= price:
-                        out.append({
-                            "title": name[:200],
-                            "current_price": price,
-                            "old_price": list_price,
-                            "url": url,
-                        })
-        except Exception:
-            continue
-    return out
 
-def generic_html_prices(url: str) -> List[Dict]:
-    """Parsers muy genérico como último recurso: busca elementos con clases típicas."""
-    res = SESSION.get(url)
-    res.raise_for_status()
-    soup = BeautifulSoup(res.text, "lxml")
-    rows = []
-    cards = soup.find_all(attrs={"data-product-id": True}) or soup.find_all("article") or soup.select("[data-testid*=product]")
-    for card in cards[:80]:
-        title = None
-        a = card.find("a", href=True)
-        if a and a.text.strip():
-            title = a.text.strip()
-        elif card.find("h3"):
-            title = card.find("h3").get_text(strip=True)
-        cur_el = card.select_one(".price, .final, .best-price, .precio, .price__current, [data-testid*=price]")
-        old_el = card.select_one(".old, .list-price, .price-old, .precio-antes, .price__old")
-        price = norm_price(cur_el.get_text() if cur_el else None)
-        list_price = norm_price(old_el.get_text() if old_el else None)
-        href = (a["href"] if a else None)
-        if href and href.startswith("//"):
-            href = "https:" + href
-        if href and href.startswith("/"):
-            href = requests.compat.urljoin(url, href)
-        if title and price and list_price:
-            rows.append({
-                "title": title[:200],
-                "current_price": price,
-                "old_price": list_price,
-                "url": href or url
-            })
-    # añade también lo que se encuentre en ld+json
-    rows.extend(parse_ldjson_products(res.text))
-    return rows
-
-# ---------- VTEX ----------
-def vtex_search(domain: str, term="oferta", start=0, end=60) -> List[Dict]:
+def nearest_anchor(el) -> str | None:
     """
-    Consulta el API público de VTEX.
-    - domain: ej. https://www.plazavea.com.pe
-    - term: ft= {texto}
+    Busca el enlace (href) más cercano (ascendente) a un elemento con % de descuento.
     """
-    params = {"ft": term, "_from": start, "_to": end}
-    url = f"{domain}/api/catalog_system/pub/products/search/?{urlencode(params)}"
-    r = SESSION.get(url)
-    if r.status_code != 200:
+    node = el
+    for _ in range(5):
+        if not node:
+            break
+        if node.name == "a" and node.get("href"):
+            return node["href"]
+        node = node.parent
+    # como fallback, busca un <a> descendiente
+    a = el.find("a", href=True)
+    if a:
+        return a["href"]
+    return None
+
+
+def find_near_prices(block_text: str) -> tuple[float | None, float | None]:
+    """
+    Busca dentro de texto cercano dos precios: el actual y el anterior.
+    No es perfecto, pero ayuda como heurística genérica.
+    """
+    prices = [to_float(m.group(0)) for m in CURRENCY_REGX.finditer(block_text)]
+    prices = [p for p in prices if p is not None]
+    if len(prices) >= 2:
+        # asume precio_actual = menor, precio_antes = mayor
+        prices.sort()
+        return prices[0], prices[-1]
+    elif len(prices) == 1:
+        return prices[0], None
+    else:
+        return None, None
+
+
+def absolute(base_url: str, href: str | None) -> str | None:
+    if not href:
+        return None
+    try:
+        return urljoin(base_url, href)
+    except Exception:
+        return href
+
+
+def normalize_title(el) -> str:
+    """
+    Busca un título cercano; si no, usa el texto del elemento de descuento.
+    """
+    # intenta hermanos/ancestros con algún texto de producto
+    candidates = []
+    # a veces el texto del card completo:
+    candidates.append(el.get_text(" ", strip=True))
+    for up in el.parents:
+        if not up:
+            break
+        txt = clean_text(up.get_text(" ", strip=True))
+        if txt:
+            candidates.append(txt)
+        # corta si ya es demasiado grande
+        if len(" ".join(candidates)) > 1000:
+            break
+    # elige un texto corto y con sentido
+    candidates = sorted(set(candidates), key=len)
+    for c in candidates:
+        # preferimos algo que no sea sólo números ni % ni puro precio
+        if len(c) >= 10 and sum(ch.isalpha() for ch in c) >= 5:
+            return c[:180]
+    return el.get_text(" ", strip=True)[:180]
+
+
+def parse_store(store_name: str, url: str) -> list[dict]:
+    """
+    Intenta encontrar tarjetas con % y precios cercanos.
+    """
+    soup = fetch(url)
+    if not soup:
         return []
-    data = r.json()
-    out = []
-    for prod in data:
-        name = prod.get("productName") or prod.get("productTitle")
-        link = prod.get("link") or prod.get("linkText") or prod.get("url")
-        if link and link.startswith("/"):
-            link = domain + link
-        # tomamos el primer sku/seller
+    results = []
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+
+    # busca elementos que contengan algún "%"
+    percent_nodes = [t for t in soup.find_all(text=PERCENT_REGX) if t and t.strip()]
+    # también busca nodos con texto y no sólo strings
+    for node in soup.find_all():
+        txt = node.get_text(" ", strip=True)
+        if txt and PERCENT_REGX.search(txt):
+            percent_nodes.append(node)
+
+    seen_links = set()
+    for n in percent_nodes:
+        # Node puede ser NavigableString o Tag
+        el = n if hasattr(n, "name") else getattr(n, "parent", None)
+        if el is None:
+            continue
+
+        txt = clean_text(el.get_text(" ", strip=True))
+        m = PERCENT_REGX.search(txt)
+        if not m:
+            continue
+
         try:
-            item = prod["items"][0]
-            seller = item["sellers"][0]
-            offer = seller.get("commertialOffer", {})
-            price = norm_price(offer.get("Price") or offer.get("price"))
-            list_price = norm_price(offer.get("ListPrice") or offer.get("listPrice"))
-            if price and list_price and list_price >= price:
-                out.append({
-                    "title": str(name)[:200],
-                    "current_price": price,
-                    "old_price": list_price,
-                    "url": link,
-                })
+            pct = int(m.group(1))
         except Exception:
             continue
-    return out
 
-def scrape_vtex(domain: str, fallback_urls: List[str]) -> List[Dict]:
-    # 1) Intento API por términos comunes
-    all_rows = []
-    for t in ("oferta", "descuento", "promo"):
-        try:
-            rows = vtex_search(domain, term=t, start=0, end=80)
-            all_rows.extend(rows)
-            time.sleep(0.7)
-        except Exception:
-            pass
-    # 2) Fallback a HTML en páginas de ofertas
-    for u in fallback_urls:
-        try:
-            rows = generic_html_prices(u)
-            all_rows.extend(rows)
-            time.sleep(0.7)
-        except Exception:
-            pass
-    return all_rows
-
-# ---------- RIPLEY / FALABELLA / TOTTUS ----------
-def scrape_generic_with_ld(domain_url: str, landing_urls: List[str]) -> List[Dict]:
-    rows = []
-    for u in landing_urls:
-        try:
-            res = SESSION.get(u)
-            res.raise_for_status()
-            html = res.text
-            rows.extend(parse_ldjson_products(html))
-            if not rows:  # intento súper genérico
-                rows.extend(generic_html_prices(u))
-            time.sleep(0.7)
-        except Exception:
+        if pct < MIN_DISCOUNT:
             continue
-    return rows
 
-# ---------- Orquestador ----------
-def clean_and_filter(rows: List[Dict], min_pct=80.0, add_store=None) -> List[Dict]:
-    out = []
-    seen = set()
-    for r in rows:
-        price = norm_price(r.get("current_price"))
-        list_price = norm_price(r.get("old_price"))
-        if not (price and list_price and list_price > 0):
+        href = nearest_anchor(el)
+        link = absolute(base, href)
+        if not link or link in seen_links:
             continue
-        d = pct_off(list_price, price)
-        if d >= min_pct:
-            url = r.get("url")
-            key = (r.get("title"), url, price, list_price)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({
-                "title": r.get("title")[:200],
-                "current_price": round(price, 2),
-                "old_price": round(list_price, 2),
-                "discount_pct": d,
-                "store": add_store,
-                "url": url,
-            })
-    return out
+
+        # Busca precios cercanos en texto de ancestros inmediatos
+        block_text = txt
+        # agrega texto ascendiendo un poco
+        up = el.parent
+        steps = 0
+        while up and steps < 2:
+            block_text += " " + clean_text(up.get_text(" ", strip=True))
+            up = up.parent
+            steps += 1
+
+        price, original = find_near_prices(block_text)
+
+        # Intenta un "título" simple
+        title = normalize_title(el)
+
+        results.append(
+            {
+                "store": store_name,
+                "title": title,
+                "price": price,
+                "original_price": original,
+                "discount_percent": pct,
+                "link": link,
+                "found_on": url,
+            }
+        )
+        seen_links.add(link)
+
+    return results
+
 
 def main():
-    print("== Scraper ofertas Perú (>=80%) ==")
-    all_results: List[Dict] = []
+    all_offers: list[dict] = []
 
-    # --- VTEX (Plaza Vea, Wong, Oechsle)
-    vtex_sites = [
-        {
-            "store": "Plaza Vea",
-            "domain": "https://www.plazavea.com.pe",
-            "fallback": [
-                "https://www.plazavea.com.pe/busca?ft=oferta",
-                "https://www.plazavea.com.pe/busca?ft=descuento",
-            ],
-        },
-        {
-            "store": "Wong",
-            "domain": "https://www.wong.pe",
-            "fallback": [
-                "https://www.wong.pe/busca?ft=oferta",
-                "https://www.wong.pe/busca?ft=descuento",
-            ],
-        },
-        {
-            "store": "Oechsle",
-            "domain": "https://www.oechsle.pe",
-            "fallback": [
-                "https://www.oechsle.pe/busca?ft=oferta",
-                "https://www.oechsle.pe/busca?ft=descuento",
-            ],
-        },
-    ]
-    for site in vtex_sites:
-        print(f"-> {site['store']}")
-        rows = scrape_vtex(site["domain"], site["fallback"])
-        rows = clean_and_filter(rows, min_pct=80.0, add_store=site["store"])
-        print(f"   {len(rows)} ofertas >=80%")
-        all_results.extend(rows)
+    for store, url in STORE_PAGES:
+        try:
+            print(f"[+] Scrape {store}: {url}")
+            offers = parse_store(store, url)
+            print(f"    -> {len(offers)} ofertas encontradas (>= {MIN_DISCOUNT}%)")
+            all_offers.extend(offers)
+        except Exception as e:
+            print(f"    ! Error con {store}: {e}")
+        # respirito humilde para no golpear las webs
+        time.sleep(2)
 
-    # --- Ripley
-    print("-> Ripley")
-    ripley_rows = scrape_generic_with_ld(
-        "https://simple.ripley.com.pe",
-        [
-            "https://simple.ripley.com.pe/tecno/ofertas",
-            "https://simple.ripley.com.pe/promociones",
-            "https://simple.ripley.com.pe/busca?Ntt=oferta",
-        ],
-    )
-    ripley_rows = clean_and_filter(ripley_rows, 80.0, "Ripley")
-    print(f"   {len(ripley_rows)} ofertas >=80%")
-    all_results.extend(ripley_rows)
+    # Ordena por % desc
+    all_offers.sort(key=lambda x: (x.get("discount_percent") or 0), reverse=True)
 
-    # --- Falabella
-    print("-> Falabella")
-    falabella_rows = scrape_generic_with_ld(
-        "https://www.falabella.com.pe",
-        [
-            "https://www.falabella.com.pe/falabella-pe/page/ofertas",
-            "https://www.falabella.com.pe/falabella-pe/search?Ntt=oferta",
-        ],
-    )
-    falabella_rows = clean_and_filter(falabella_rows, 80.0, "Falabella")
-    print(f"   {len(falabella_rows)} ofertas >=80%")
-    all_results.extend(falabella_rows)
+    # Escribe el JSON (aunque esté vacío)
+    with open("offers.json", "w", encoding="utf-8") as f:
+        json.dump(all_offers, f, ensure_ascii=False, indent=2)
 
-    # --- Tottus
-    print("-> Tottus")
-    tottus_rows = scrape_generic_with_ld(
-        "https://www.tottus.com.pe",
-        [
-            "https://www.tottus.com.pe/tottus-pe/search?Ntt=oferta",
-            "https://www.tottus.com.pe/tottus-pe/page/ofertas",
-        ],
-    )
-    tottus_rows = clean_and_filter(tottus_rows, 80.0, "Tottus")
-    print(f"   {len(tottus_rows)} ofertas >=80%")
-    all_results.extend(tottus_rows)
+    print(f"[OK] Guardado offers.json con {len(all_offers)} entradas")
 
-    # Top 50 mejores descuentos
-    all_results = keep_top_n(all_results, n=50)
-    save_offers(all_results, "offers.json")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("[ERROR]", e)
-        sys.exit(1)
+    main()
