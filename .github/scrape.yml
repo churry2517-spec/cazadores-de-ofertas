@@ -1,0 +1,35 @@
+name: Scrape and Update Offers
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # Se ejecuta todos los días a las 3 AM (hora UTC)
+  workflow_dispatch:      # Permite ejecutarlo manualmente
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install -r scraper/requirements.txt
+
+      - name: Run scraper
+        run: |
+          python scraper/scraper.py
+
+      - name: Commit updated offers.json
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add offers.json
+          git commit -m "Update offers data" || echo "No changes to commit"
+          git push
