@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cazadores de Ofertas 💸🔥</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <h1>Ofertas con 80% Descuento 🤑</h1>
+    <div id="offers"></div>
+
+    <script>
+        async function loadOffers() {
+            const response = await fetch("offers.json");
+            const offers = await response.json();
+
+            const container = document.getElementById("offers");
+            container.innerHTML = offers.map(o => `
+                <div class="offer">
+                    <h2>${o.title}</h2>
+                    <p>Precio: ${o.price}</p>
+                    <a href="${o.link}" target="_blank">Ver oferta</a>
+                </div>
+            `).join("");
+        }
+        loadOffers();
+    </script>
+</body>
+</html>
