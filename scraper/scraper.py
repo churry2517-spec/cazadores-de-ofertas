@@ -1,36 +1,40 @@
-import json
-import requests
+import json, requests
 from bs4 import BeautifulSoup
 
 def get_falabella_offers():
-    url = "https://www.falabella.com.pe/falabella-pe/page/ofertas"
+    url = "https://www.falabella.com.pe/falabella-pe/category/cat70062/Tecnologia?sort=discount_DESC"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "Referer": "https://www.google.com"
     }
 
     response = requests.get(url, headers=headers)
     soup = BeautifulSoup(response.text, "html.parser")
 
     offers = []
-    products = soup.select("div.es-product-card-card")
+    products = soup.select("div.jsx-1833870200")
 
-    for product in products[:10]:  # Solo 10 para pruebas
-        title_tag = product.select_one("b.es-product-card-name")
-        price_tag = product.select_one("span.es-product-card-price__current")
-        link_tag = product.find("a")
-
-        title = title_tag.get_text(strip=True) if title_tag else "Sin nombre"
-        price = price_tag.get_text(strip=True) if price_tag else "Sin precio"
-        link = "https://www.falabella.com.pe" + link_tag["href"] if link_tag else ""
-
-        offers.append({
-            "title": title,
-            "price": price,
-            "link": link
-        })
+    for p in products[:12]:
+        try:
+            title = p.select_one("b.jsx-1833870200").get_text(strip=True)
+            price = p.select_one("li.jsx-2835952914.-oldPrice small").get_text(strip=True)
+            link = "https://www.falabella.com.pe" + p.select_one("a")["href"]
+            
+            offers.append({
+                "title": title,
+                "price": price,
+                "link": link
+            })
+        except:
+            continue
 
     return offers
 
-# Obtener ofertas y guardar json
-offers = get_fa_
+offers = get_falabella_offers()
+
+with open("offers.json", "w", encoding="utf-8") as f:
+    json.dump(offers, f, indent=2, ensure_ascii=False)
+
+print("✅ Scraping completado, ofertas:", len(offers))
